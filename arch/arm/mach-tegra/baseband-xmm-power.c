@@ -38,7 +38,7 @@
 
 MODULE_LICENSE("GPL");
 
-unsigned long modem_ver = XMM_MODEM_VER_1121;
+unsigned long modem_ver = XMM_MODEM_VER_1130;
 EXPORT_SYMBOL(modem_ver);
 
 unsigned long modem_flash;
@@ -156,7 +156,8 @@ static int baseband_xmm_power_on(struct platform_device *device)
 	else
 		ipc_ap_wake_state = IPC_AP_WAKE_INIT2;
 
-	pr_debug("%s - %d\n", __func__, __LINE__);
+	pr_debug("%s wake_st(%d) modem version %d\n", __func__,
+					ipc_ap_wake_state, modem_ver);
 
 	/* register usb host controller */
 	if (!modem_flash) {
@@ -242,6 +243,8 @@ static int baseband_xmm_power_off(struct platform_device *device)
 	wakeup_pending = false;
 	modem_sleep_flag = false;
 	spin_unlock_irqrestore(&xmm_lock, flags);
+	/* start registration process once again on xmm on */
+	register_hsic_device = true;
 	pr_debug("%s }\n", __func__);
 
 	return 0;
@@ -251,6 +254,7 @@ static ssize_t baseband_xmm_onoff(struct device *dev,
 	struct device_attribute *attr,
 	const char *buf, size_t count)
 {
+	int pwr;
 	int size;
 	struct platform_device *device = to_platform_device(dev);
 
@@ -267,12 +271,20 @@ static ssize_t baseband_xmm_onoff(struct device *dev,
 	pr_debug("%s: count=%d\n", __func__, count);
 
 	/* parse input */
-	size = sscanf(buf, "%d", &power_onoff);
+	size = sscanf(buf, "%d", &pwr);
 	if (size != 1) {
 		pr_err("%s: size=%d -EINVAL\n", __func__, size);
 		mutex_unlock(&xmm_onoff_mutex);
 		return -EINVAL;
 	}
+
+	if (power_onoff == pwr) {
+		pr_err("%s: Ignored, due to same CP power state(%d)\n",
+						__func__, power_onoff);
+		mutex_unlock(&xmm_onoff_mutex);
+		return -EINVAL;
+	}
+	power_onoff = pwr;
 	pr_debug("%s power_onoff=%d\n", __func__, power_onoff);
 
 	if (power_onoff == 0)
@@ -367,13 +379,14 @@ irqreturn_t baseband_xmm_power_ipc_ap_wake_irq(int irq, void *dev_id)
 {
 	int value;
 
-	pr_debug("%s\n", __func__);
+	value = gpio_get_value(baseband_power_driver_data->
+				modem.xmm.ipc_ap_wake);
+
+	pr_debug("%s g(%d), wake_st(%d)\n", __func__, value, ipc_ap_wake_state);
 
 	if (ipc_ap_wake_state < IPC_AP_WAKE_IRQ_READY) {
 		pr_err("%s - spurious irq\n", __func__);
 	} else if (ipc_ap_wake_state == IPC_AP_WAKE_IRQ_READY) {
-		value = gpio_get_value(baseband_power_driver_data->
-			modem.xmm.ipc_ap_wake);
 		if (!value) {
 			pr_debug("%s - IPC_AP_WAKE_INIT1"
 				" - got falling edge\n",
@@ -388,8 +401,6 @@ irqreturn_t baseband_xmm_power_ipc_ap_wake_irq(int irq, void *dev_id)
 				__func__);
 		}
 	} else if (ipc_ap_wake_state == IPC_AP_WAKE_INIT1) {
-		value = gpio_get_value(baseband_power_driver_data->
-			modem.xmm.ipc_ap_wake);
 		if (!value) {
 			pr_debug("%s - IPC_AP_WAKE_INIT2"
 				" - wait for rising edge\n",
@@ -404,8 +415,6 @@ irqreturn_t baseband_xmm_power_ipc_ap_wake_irq(int irq, void *dev_id)
 			queue_work(workqueue, &init2_work);
 		}
 	} else {
-		value = gpio_get_value(baseband_power_driver_data->
-			modem.xmm.ipc_ap_wake);
 		if (!value) {
 			pr_debug("%s - falling\n", __func__);
 			/* [ver < 1130] gpio protocol falling edge */
@@ -818,7 +827,9 @@ static int baseband_xmm_power_driver_probe(struct platform_device *device)
 	if (modem_flash && modem_pm) {
 		pr_debug("%s: request_irq IPC_AP_WAKE_IRQ\n", __func__);
 		ipc_ap_wake_state = IPC_AP_WAKE_UNINIT;
-		err = request_irq(gpio_to_irq(data->modem.xmm.ipc_ap_wake),
+		err = request_threaded_irq(
+			gpio_to_irq(data->modem.xmm.ipc_ap_wake),
+			NULL,
 			baseband_xmm_power_ipc_ap_wake_irq,
 			IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
 			"IPC_AP_WAKE_IRQ",
@@ -828,6 +839,9 @@ static int baseband_xmm_power_driver_probe(struct platform_device *device)
 				__func__);
 			return err;
 		}
+		err = enable_irq_wake(gpio_to_irq(data->modem.xmm.ipc_ap_wake));
+		if (err < 0)
+			 pr_err("%s: enable_irq_wake error\n", __func__);
 		ipc_ap_wake_state = IPC_AP_WAKE_IRQ_READY;
 		if (modem_ver >= XMM_MODEM_VER_1130) {
 			pr_debug("%s: ver > 1130: AP_WAKE_INIT1\n", __func__);
