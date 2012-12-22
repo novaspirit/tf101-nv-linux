@@ -64,8 +64,6 @@ struct tegra_dma_channel;
 #define TEGRA_DMA_REQ_SEL_SL2B6			28
 #define TEGRA_DMA_REQ_SEL_INVALID		31
 
-#define TEGRA_DMA_MAX_TRANSFER_SIZE		0x10000
-
 enum tegra_dma_mode {
 	TEGRA_DMA_SHARED = 1,
 	TEGRA_DMA_MODE_CONTINUOUS = 2,
@@ -74,9 +72,33 @@ enum tegra_dma_mode {
 	TEGRA_DMA_MODE_ONESHOT = 8,
 };
 
-enum tegra_dma_req_error {
+/*
+ * tegra_dma_req_status: Dma request status
+ * TEGRA_DMA_REQ_SUCCESS: The request has been successfully completed.
+ *	  	The byte_transferred tells number of bytes transferred.
+ * TEGRA_DMA_REQ_ERROR_ABORTED: The request is aborted by client after
+ *	 	calling tegra_dma_dequeue_req.
+ *		The byte_transferred tells number of bytes transferred
+ *		which may be more than request size due to buffer
+ *		wrap-up in continuous mode.
+ * TEGRA_DMA_REQ_ERROR_STOPPED: Applicable in continuous mode.
+ *		The request is stopped forcefully. This may be becasue of
+ *		- due to non-available of next request.
+ *		- not able to serve current interrupt before next buffer
+ *		  completed by dma. This can happen if buffer req size is
+ *		  not enough and it transfer completes before system actually
+ *		  serve the previous dma interrupts.
+ *		The byte_transferred will not be accurate in this case. It will
+ *		just give an idea that how much approximately have been
+ *		transferred by dma.
+ * TEGRA_DMA_REQ_INFLIGHT: The request is configured in the dma register
+ *		for transfer.
+ */
+
+enum tegra_dma_req_status {
 	TEGRA_DMA_REQ_SUCCESS = 0,
 	TEGRA_DMA_REQ_ERROR_ABORTED,
+	TEGRA_DMA_REQ_ERROR_STOPPED,
 	TEGRA_DMA_REQ_INFLIGHT,
 };
 
@@ -161,9 +183,9 @@ bool tegra_dma_is_req_inflight(struct tegra_dma_channel *ch,
 int tegra_dma_get_transfer_count(struct tegra_dma_channel *ch,
 			struct tegra_dma_req *req);
 bool tegra_dma_is_empty(struct tegra_dma_channel *ch);
-bool tegra_dma_is_stopped(struct tegra_dma_channel *ch);
 
-struct tegra_dma_channel *tegra_dma_allocate_channel(int mode, const char namefmt [ ],...);
+struct tegra_dma_channel *tegra_dma_allocate_channel(int mode,
+		const char namefmt[], ...);
 void tegra_dma_free_channel(struct tegra_dma_channel *ch);
 int tegra_dma_cancel(struct tegra_dma_channel *ch);
 

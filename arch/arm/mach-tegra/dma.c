@@ -3,7 +3,7 @@
  *
  * System DMA driver for NVIDIA Tegra SoCs
  *
- * Copyright (c) 2008-2011, NVIDIA Corporation.
+ * Copyright (c) 2008-2012, NVIDIA Corporation.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -51,11 +51,10 @@
 #define CSR_ONCE				(1<<27)
 #define CSR_FLOW				(1<<21)
 #define CSR_REQ_SEL_SHIFT			16
-#define CSR_REQ_SEL_MASK			(0x1F<<CSR_REQ_SEL_SHIFT)
 #define CSR_WCOUNT_SHIFT			2
 #define CSR_WCOUNT_MASK				0xFFFC
 
-#define APB_DMA_CHAN_STA				0x004
+#define APB_DMA_CHAN_STA			0x004
 #define STA_BUSY				(1<<31)
 #define STA_ISE_EOC				(1<<30)
 #define STA_HALT				(1<<29)
@@ -63,9 +62,9 @@
 #define STA_COUNT_SHIFT				2
 #define STA_COUNT_MASK				0xFFFC
 
-#define APB_DMA_CHAN_AHB_PTR				0x010
+#define APB_DMA_CHAN_AHB_PTR			0x010
 
-#define APB_DMA_CHAN_AHB_SEQ				0x014
+#define APB_DMA_CHAN_AHB_SEQ			0x014
 #define AHB_SEQ_INTR_ENB			(1<<31)
 #define AHB_SEQ_BUS_WIDTH_SHIFT			28
 #define AHB_SEQ_BUS_WIDTH_MASK			(0x7<<AHB_SEQ_BUS_WIDTH_SHIFT)
@@ -83,9 +82,9 @@
 #define AHB_SEQ_WRAP_SHIFT			16
 #define AHB_SEQ_WRAP_MASK			(0x7<<AHB_SEQ_WRAP_SHIFT)
 
-#define APB_DMA_CHAN_APB_PTR				0x018
+#define APB_DMA_CHAN_APB_PTR			0x018
 
-#define APB_DMA_CHAN_APB_SEQ				0x01c
+#define APB_DMA_CHAN_APB_SEQ			0x01c
 #define APB_SEQ_BUS_WIDTH_SHIFT			28
 #define APB_SEQ_BUS_WIDTH_MASK			(0x7<<APB_SEQ_BUS_WIDTH_SHIFT)
 #define APB_SEQ_BUS_WIDTH_8			(0<<APB_SEQ_BUS_WIDTH_SHIFT)
@@ -107,14 +106,23 @@
 #define TEGRA_SYSTEM_DMA_CH_MAX	\
 	(TEGRA_SYSTEM_DMA_CH_NR - TEGRA_SYSTEM_DMA_AVP_CH_NUM - 1)
 
+/* Maximum dma transfer size */
+#define TEGRA_DMA_MAX_TRANSFER_SIZE		0x10000
+
 static struct clk *dma_clk;
+
 static const unsigned int ahb_addr_wrap_table[8] = {
 	0, 32, 64, 128, 256, 512, 1024, 2048
 };
 
-static const unsigned int apb_addr_wrap_table[8] = {0, 1, 2, 4, 8, 16, 32, 64};
+static const unsigned int apb_addr_wrap_table[8] = {
+	0, 1, 2, 4, 8, 16, 32, 64
+};
 
-static const unsigned int bus_width_table[5] = {8, 16, 32, 64, 128};
+static const unsigned int bus_width_table[5] = {
+	8, 16, 32, 64, 128
+};
+
 static void __iomem *general_dma_addr = IO_ADDRESS(TEGRA_APB_DMA_BASE);
 typedef void (*dma_isr_handler)(struct tegra_dma_channel *ch);
 
@@ -155,7 +163,7 @@ void tegra_dma_flush(struct tegra_dma_channel *ch)
 }
 EXPORT_SYMBOL(tegra_dma_flush);
 
-void tegra_dma_stop(struct tegra_dma_channel *ch)
+static void tegra_dma_stop(struct tegra_dma_channel *ch)
 {
 	u32 csr;
 	u32 status;
@@ -170,11 +178,6 @@ void tegra_dma_stop(struct tegra_dma_channel *ch)
 	status = readl(ch->addr + APB_DMA_CHAN_STA);
 	if (status & STA_ISE_EOC)
 		writel(status, ch->addr + APB_DMA_CHAN_STA);
-}
-
-bool tegra_dma_is_stopped(struct tegra_dma_channel *ch)
-{
-	return !!(readl(ch->addr + APB_DMA_CHAN_STA) & CSR_ENB);
 }
 
 int tegra_dma_cancel(struct tegra_dma_channel *ch)
@@ -232,6 +235,62 @@ static inline unsigned int get_req_xfer_word_count(
 		return req->size >> 3;
 	else
 		return req->size >> 2;
+}
+
+static int get_current_xferred_count(struct tegra_dma_channel *ch,
+	struct tegra_dma_req *req, unsigned long status)
+{
+	int req_transfer_count;
+	req_transfer_count = get_req_xfer_word_count(ch, req) << 2;
+	return req_transfer_count - ((status & STA_COUNT_MASK) + 4);
+}
+
+static void tegra_dma_abort_req(struct tegra_dma_channel *ch,
+		struct tegra_dma_req *req, const char *warn_msg)
+{
+	unsigned long status = readl(ch->addr + APB_DMA_CHAN_STA);
+
+	/*
+	 * Check if interrupt is pending.
+	 * This api is called from isr and hence need not to call
+	 * isr handle again, just update the byte_transferred.
+	 */
+	if (status & STA_ISE_EOC)
+		req->bytes_transferred += get_req_xfer_word_count(ch, req) << 2;
+	tegra_dma_stop(ch);
+
+	req->bytes_transferred +=  get_current_xferred_count(ch, req, status);
+	req->status = -TEGRA_DMA_REQ_ERROR_STOPPED;
+	if (warn_msg)
+		WARN(1, KERN_WARNING "%s\n", warn_msg);
+	start_head_req(ch);
+}
+
+static void handle_continuous_head_request(struct tegra_dma_channel *ch,
+		struct tegra_dma_req *last_req)
+{
+	struct tegra_dma_req *hreq = NULL;
+
+	if (list_empty(&ch->list)) {
+		tegra_dma_abort_req(ch, last_req, NULL);
+		return;
+	}
+
+	/*
+	 * Check that head req on list should be in flight.
+	 * If it is not in flight then request came late
+	 * and so need to abort dma and start next request
+	 * immediately.
+	 */
+	hreq = list_entry(ch->list.next, typeof(*hreq), node);
+	if (hreq->status != TEGRA_DMA_REQ_INFLIGHT) {
+		tegra_dma_abort_req(ch, last_req, "Req was not queued on time");
+		return;
+	}
+
+	/* Configure next request in single buffer mode */
+	if (ch->mode & TEGRA_DMA_MODE_CONTINUOUS_SINGLE)
+		configure_next_req(ch, hreq);
 }
 
 static unsigned int get_channel_status(struct tegra_dma_channel *ch,
@@ -378,6 +437,7 @@ bool tegra_dma_is_req_inflight(struct tegra_dma_channel *ch,
 	return false;
 }
 EXPORT_SYMBOL(tegra_dma_is_req_inflight);
+
 int tegra_dma_get_transfer_count(struct tegra_dma_channel *ch,
 			struct tegra_dma_req *req)
 {
@@ -415,10 +475,19 @@ int tegra_dma_enqueue_req(struct tegra_dma_channel *ch,
 	unsigned long irq_flags;
 	struct tegra_dma_req *_req;
 	int start_dma = 0;
+	struct tegra_dma_req *hreq, *hnreq;
 
 	if (req->size > TEGRA_DMA_MAX_TRANSFER_SIZE ||
 		req->source_addr & 0x3 || req->dest_addr & 0x3) {
 		pr_err("Invalid DMA request for channel %d\n", ch->id);
+		return -EINVAL;
+	}
+
+	if ((req->size & 0x3) ||
+	   ((ch->mode & TEGRA_DMA_MODE_CONTINUOUS_DOUBLE) && (req->size & 0x7)))
+	{
+		pr_err("Invalid DMA request size 0x%08x for channel %d\n",
+				req->size, ch->id);
 		return -EINVAL;
 	}
 
@@ -443,20 +512,16 @@ int tegra_dma_enqueue_req(struct tegra_dma_channel *ch,
 	if (start_dma) {
 		tegra_dma_update_hw(ch, req);
 	} else {
-		struct tegra_dma_req *first_req, *second_req;
-		first_req = list_entry(ch->list.next,
-					typeof(*first_req), node);
-		second_req = list_entry(first_req->node.next,
-					typeof(*second_req), node);
-
 		/*
 		 * Check to see if this request needs to be configured
-		 * immediately
+		 * immediately in continuous mode.
 		 */
-		if (second_req != req)
+		if (ch->mode & TEGRA_DMA_MODE_ONESHOT)
 			goto end;
 
-		if (ch->mode & TEGRA_DMA_MODE_ONESHOT)
+		hreq = list_entry(ch->list.next, typeof(*hreq), node);
+		hnreq = list_entry(hreq->node.next, typeof(*hnreq), node);
+		if (hnreq != req)
 			goto end;
 
 		if ((ch->mode & TEGRA_DMA_MODE_CONTINUOUS_DOUBLE) &&
@@ -545,6 +610,8 @@ void tegra_dma_free_channel(struct tegra_dma_channel *ch)
 	__clear_bit(ch->id, channel_usage);
 	memset(ch->client_name, 0, sizeof(ch->client_name));
 	ch->isr_handler = NULL;
+	ch->callback = NULL;
+	ch->cb_req = NULL;
 	mutex_unlock(&tegra_dma_lock);
 }
 EXPORT_SYMBOL(tegra_dma_free_channel);
@@ -778,7 +845,6 @@ static void handle_oneshot_dma(struct tegra_dma_channel *ch)
 static void handle_continuous_dbl_dma(struct tegra_dma_channel *ch)
 {
 	struct tegra_dma_req *req;
-	struct tegra_dma_req *nreq;
 
 	req = list_entry(ch->list.next, typeof(*req), node);
 
@@ -797,28 +863,25 @@ static void handle_continuous_dbl_dma(struct tegra_dma_channel *ch)
 			 * We should not land here if queue mechanism
 			 * with system latency are properly configured.
 			 */
-			WARN_ON(1);
-			req->buffer_status = TEGRA_DMA_REQ_BUF_STATUS_FULL;
 			req->bytes_transferred += req->size;
-			req->status = TEGRA_DMA_REQ_SUCCESS;
-			tegra_dma_stop(ch);
 
 			list_del(&req->node);
-
 			ch->callback = req->complete;
 			ch->cb_req = req;
 
-			start_head_req(ch);
+			tegra_dma_abort_req(ch, req,
+				"Dma becomes out of sync for ping-pong buffer");
 			return;
 		}
 
 		/*
 		 * Configure next request so after full buffer transfer,
-		 * it can be start.
+		 * it can be start without sw intervention.
 		 */
 		configure_next_req(ch, req);
 
 		req->buffer_status = TEGRA_DMA_REQ_BUF_STATUS_HALF_FULL;
+		req->status = TEGRA_DMA_REQ_SUCCESS;
 		req->bytes_transferred += req->size >> 1;
 
 		ch->callback = req->threshold;
@@ -836,29 +899,10 @@ static void handle_continuous_dbl_dma(struct tegra_dma_channel *ch)
 		ch->callback = req->complete;
 		ch->cb_req = req;
 
-		if (list_empty(&ch->list)) {
-			tegra_dma_stop(ch);
-		} else {
-			/* Check that next req on list should be in flight */
-			nreq = list_entry(ch->list.next, typeof(*nreq), node);
-			if (nreq->status != TEGRA_DMA_REQ_INFLIGHT) {
-				/*
-				 * We should not land here if queue mechanism
-				 * with system latency are properly configured.
-				 */
-				WARN_ON(1);
-				tegra_dma_stop(ch);
-				start_head_req(ch);
-			}
-		}
-
-		list_del(&req->node);
-
-		ch->callback = req->complete;
-		ch->cb_req = req;
+		handle_continuous_head_request(ch, req);
 		return;
 	}
-	tegra_dma_stop(ch);
+	tegra_dma_abort_req(ch, req, "Dma status is not on sync\n");
 	/* Dma should be stop much earlier */
 	BUG();
 	return;
@@ -867,7 +911,6 @@ static void handle_continuous_dbl_dma(struct tegra_dma_channel *ch)
 static void handle_continuous_sngl_dma(struct tegra_dma_channel *ch)
 {
 	struct tegra_dma_req *req;
-	struct tegra_dma_req *nreq;
 
 	req = list_entry(ch->list.next, typeof(*req), node);
 	if (req->buffer_status == TEGRA_DMA_REQ_BUF_STATUS_FULL) {
@@ -887,21 +930,7 @@ static void handle_continuous_sngl_dma(struct tegra_dma_channel *ch)
 	ch->callback = req->complete;
 	ch->cb_req = req;
 
-	if (list_empty(&ch->list)) {
-		pr_debug("%s: stop\n", __func__);
-		tegra_dma_stop(ch);
-	} else {
-		/* Head req should be in flight */
-		nreq = list_entry(ch->list.next, typeof(*nreq), node);
-		if (nreq->status != TEGRA_DMA_REQ_INFLIGHT) {
-			tegra_dma_stop(ch);
-			WARN_ON(1);
-			start_head_req(ch);
-		} else {
-			/* Configure next req */
-			configure_next_req(ch, nreq);
-		}
-	}
+	handle_continuous_head_request(ch, req);
 	return;
 }
 
@@ -965,30 +994,29 @@ int __init tegra_dma_init(void)
 	int ret = 0;
 	int i;
 	unsigned int irq;
-	struct clk *c;
 
 	bitmap_fill(channel_usage, NV_DMA_MAX_CHANNELS);
 
-	c = clk_get_sys("tegra-dma", NULL);
-	if (IS_ERR(c)) {
+	dma_clk = clk_get_sys("tegra-dma", NULL);
+	if (IS_ERR_OR_NULL(dma_clk)) {
 		pr_err("Unable to get clock for APB DMA\n");
-		ret = PTR_ERR(c);
+		ret = PTR_ERR(dma_clk);
 		goto fail;
 	}
-	ret = clk_enable(c);
+	ret = clk_enable(dma_clk);
 	if (ret != 0) {
 		pr_err("Unable to enable clock for APB DMA\n");
 		goto fail;
 	}
 
-	dma_clk = clk_get_sys("apbdma", "apbdma");
-	if (!IS_ERR_OR_NULL(dma_clk)) {
-		clk_enable(dma_clk);
-		tegra_periph_reset_assert(dma_clk);
-		udelay(10);
-		tegra_periph_reset_deassert(dma_clk);
-		udelay(10);
-	}
+	/*
+	 * Resetting all dma channels to make sure all channels are in init
+	 * state.
+	 */
+	tegra_periph_reset_assert(dma_clk);
+	udelay(10);
+	tegra_periph_reset_deassert(dma_clk);
+	udelay(10);
 
 	writel(GEN_ENABLE, general_dma_addr + APB_DMA_GEN);
 	writel(0, general_dma_addr + APB_DMA_CNTRL);
@@ -1067,6 +1095,8 @@ static int tegra_dma_suspend(void)
 		*ctx++ = readl(addr + APB_DMA_CHAN_APB_SEQ);
 	}
 
+	/* Disabling clock of dma. */
+	clk_disable(dma_clk);
 	return 0;
 }
 
@@ -1074,6 +1104,9 @@ static void tegra_dma_resume(void)
 {
 	u32 *ctx = apb_dma;
 	int i;
+
+	/* Enabling clock of dma. */
+	clk_enable(dma_clk);
 
 	writel(*ctx++, general_dma_addr + APB_DMA_GEN);
 	writel(*ctx++, general_dma_addr + APB_DMA_CNTRL);
